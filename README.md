@@ -18,6 +18,8 @@
 
 ## Wiring & Schematic
 
+![ESP32 Groovebox Hardware Schematic](schematic.png)
+
 ```
                           ESP32-WROOM-32
                      +----------------------+
