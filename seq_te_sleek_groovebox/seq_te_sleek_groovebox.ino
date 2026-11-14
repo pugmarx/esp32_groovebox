@@ -6,6 +6,14 @@
 #include <math.h>
 
 // ==========================================
+// 0. FIRMWARE VERSION
+// ==========================================
+#define FW_NAME    "GROOVEBOX"
+#define FW_VERSION "v5.0"
+// v5.0: 32-bit APLL I2S, PolyBLEP oscillators, SVF resonant filter,
+//       master DC blocker, and BPM-synced metronome screensaver.
+
+// ==========================================
 // 1. PIN CONFIGURATIONS (100% UNCHANGED)
 // ==========================================
 
@@ -102,8 +110,6 @@ unsigned long lastNavTime = 0;
 
 // Screensaver timer (triggers after 30s of inactivity)
 unsigned long lastUserInteraction = 0;
-float reelAngle = 0.0f;
-int animFrame = 0;
 
 int lastNavCLK = HIGH, lastPitchCLK = HIGH, lastDecayCLK = HIGH, lastTempoCLK = HIGH;
 int lastToggleBtn = HIGH, lastTrackBtn = HIGH;
@@ -160,18 +166,28 @@ void initializeTracks() {
 
 void setup() {
   Serial.begin(115200);
+  Serial.println();
+  Serial.print(FW_NAME);
+  Serial.print(" ");
+  Serial.print(FW_VERSION);
+  Serial.print(" (built ");
+  Serial.print(__DATE__);
+  Serial.print(" ");
+  Serial.print(__TIME__);
+  Serial.println(")");
 
   // Large 16 x 256 DMA Buffer (~93ms) prevents audio dropouts
+  // 32-bit I2S + APLL gives PCM5102A a low-jitter, studio-clean noise floor
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 16,
     .dma_buf_len = 256,
-    .use_apll = false
+    .use_apll = true
   };
 
   i2s_pin_config_t pin_config = {
@@ -194,10 +210,14 @@ void setup() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
-  display.setCursor(22, 18);
-  display.println("GROOVEBOX v4");
-  display.setCursor(18, 36);
-  display.println("Smooth Clean Audio");
+  display.setCursor(22, 16);
+  display.print(FW_NAME);
+  display.print(" ");
+  display.println(FW_VERSION);
+  display.setCursor(10, 32);
+  display.println("32-bit PolyBLEP SVF");
+  display.setCursor(26, 46);
+  display.println(__DATE__);
   display.display();
   delay(1200);
 
@@ -251,11 +271,37 @@ inline float softLimit(float x) {
   return x / sqrtf(1.0f + x * x);
 }
 
+// PolyBLEP anti-aliasing correction for crisp, alias-free oscillators
+inline float polyBlep(float t, float dt) {
+  if (t < dt) {
+    t /= dt;
+    return t + t - t * t - 1.0f;
+  } else if (t > 1.0f - dt) {
+    t = (t - 1.0f) / dt;
+    return t * t + t + t + 1.0f;
+  }
+  return 0.0f;
+}
+
+// Chamberlin State-Variable Filter (mode: 0 = LP, 1 = HP, 2 = BP)
+inline float svfProcess(float input, float &low, float &band, float f, float q, int mode) {
+  float high = input - low - q * band;
+  band += f * high;
+  low += f * band;
+  if (mode == 1) return high;
+  if (mode == 2) return band;
+  return low;
+}
+
+// Master DC-blocker state (~20 Hz high-pass)
+float dcPrevInL = 0.0f, dcPrevOutL = 0.0f;
+float dcPrevInR = 0.0f, dcPrevOutR = 0.0f;
+
 // ==========================================
 // 3. AUDIO ENGINE
 // ==========================================
 void generateAudio() {
-  int16_t audioBuffer[BUFFER_SIZE * 2];
+  int32_t audioBuffer[BUFFER_SIZE * 2];
 
   for (int s = 0; s < BUFFER_SIZE; s++) {
     sidechainAmount *= 0.99965f;
@@ -267,44 +313,6 @@ void generateAudio() {
     for (int i = 0; i < NUM_TRACKS; i++) {
       Track &t = tracks[i];
       if (!t.active) continue;
-
-      float rawSample = 0.0f;
-
-      if (t.waveType == 0) {
-        rawSample = sinf(t.phase);
-        t.currentFreq = t.baseFreq + (t.currentFreq - t.baseFreq) * 0.9991f;
-      }
-      else if (t.waveType == 1) {
-        noiseSeed = noiseSeed * 1664525 + 1013904223;
-        float noise = ((float)(noiseSeed & 0xFFFF) / 32768.0f) - 1.0f;
-        float hp = noise - t.filterState1;
-        t.filterState1 = t.filterState1 * 0.30f + noise * 0.70f;
-        t.filterState2 = t.filterState2 * 0.55f + hp * 0.45f;
-        rawSample = t.filterState2 * 0.85f;
-      }
-      else if (t.waveType == 2) {
-        float fundamental = sinf(t.phase);
-        float overtone1   = sinf(t.phase * 2.0f) * 0.38f;
-        float overtone2   = sinf(t.phase * 3.0f) * 0.16f;
-        rawSample = fundamental + overtone1 + overtone2;
-      }
-      else if (t.waveType == 3) {
-        float saw = 2.0f * (t.phase / (2.0f * M_PI)) - 1.0f;
-        t.filterState1 = t.filterState1 * 0.84f + saw * 0.16f;
-        t.filterState2 = t.filterState2 * 0.84f + t.filterState1 * 0.16f;
-        rawSample = t.filterState2 * 1.5f;
-      }
-      else if (t.waveType == 4) {
-        float fundamental = sinf(t.phase);
-        float overtone1   = sinf(t.phase * 2.0f) * 0.35f;
-        float overtone2   = sinf(t.phase * 3.0f) * 0.15f;
-        rawSample = fundamental + overtone1 + overtone2;
-      }
-      else if (t.waveType == 5) {
-        float saw = 2.0f * (t.phase / (2.0f * M_PI)) - 1.0f;
-        float tri = 2.0f * fabsf(saw) - 1.0f;
-        rawSample = tri * 0.7f + sinf(t.phase) * 0.3f;
-      }
 
       if (t.envStage == 1) {
         t.envCounter++;
@@ -324,6 +332,51 @@ void generateAudio() {
           t.envStage = 0;
           t.envLevel = 0.0f;
         }
+      }
+
+      float p = t.phase / (2.0f * M_PI);
+      float dt = t.currentFreq / SAMPLE_RATE;
+      float rawSample = 0.0f;
+
+      if (t.waveType == 0) {
+        // Pure 808 Kick with subtle 2ms transient click
+        rawSample = sinf(t.phase);
+        if (t.envStage == 1 || (t.envStage == 2 && t.envCounter < 90)) {
+          float clickEnv = (t.envStage == 1) ? t.envLevel : (1.0f - (float)t.envCounter / 90.0f);
+          rawSample += sinf(t.phase * 3.0f) * 0.25f * clickEnv;
+        }
+        t.currentFreq = t.baseFreq + (t.currentFreq - t.baseFreq) * 0.9991f;
+      }
+      else if (t.waveType == 1) {
+        // Silky SVF High-Pass Hi-Hat
+        noiseSeed = noiseSeed * 1664525 + 1013904223;
+        float noise = ((float)(noiseSeed & 0xFFFF) / 32768.0f) - 1.0f;
+        rawSample = svfProcess(noise, t.filterState1, t.filterState2, 0.72f, 0.85f, 1) * 0.85f;
+      }
+      else if (t.waveType == 2) {
+        // Clean Sub-Bass with gentle harmonic warmth
+        float fundamental = sinf(t.phase);
+        float overtone1   = sinf(t.phase * 2.0f) * 0.22f;
+        rawSample = svfProcess(fundamental + overtone1, t.filterState1, t.filterState2, 0.14f, 0.95f, 0);
+      }
+      else if (t.waveType == 3) {
+        // PolyBLEP Saw + Resonant SVF Low-Pass with Envelope Sweep
+        float saw = 2.0f * p - 1.0f - polyBlep(p, dt);
+        float f = constrain(0.06f + 0.42f * t.envLevel * t.envLevel, 0.04f, 0.78f);
+        rawSample = svfProcess(saw, t.filterState1, t.filterState2, f, 0.62f, 0) * 1.15f;
+      }
+      else if (t.waveType == 4) {
+        // Pure Glassy FM Pluck / Chime (harmonic index decays with envelope)
+        float modIndex = 1.4f * t.envLevel * t.envLevel;
+        float modulator = sinf(t.phase * 2.0f) * modIndex;
+        rawSample = sinf(t.phase + modulator) * 0.9f + sinf(t.phase * 3.0f) * 0.12f * t.envLevel;
+      }
+      else if (t.waveType == 5) {
+        // Clean Stab: PolyBLEP Saw + Fundamental Sine through Resonant SVF
+        float saw = 2.0f * p - 1.0f - polyBlep(p, dt);
+        float mix = saw * 0.55f + sinf(t.phase) * 0.45f;
+        float f = constrain(0.10f + 0.45f * t.envLevel * t.envLevel, 0.05f, 0.78f);
+        rawSample = svfProcess(mix, t.filterState1, t.filterState2, f, 0.68f, 0) * 1.1f;
       }
 
       float sample = rawSample * t.envLevel * t.currentVolume;
@@ -359,11 +412,20 @@ void generateAudio() {
     float totalL = dryL * 0.85f + (echoL * 0.28f);
     float totalR = dryR * 0.85f + (echoR * 0.28f);
 
-    float finalL = softLimit(totalL);
-    float finalR = softLimit(totalR);
+    // Master DC-blocking high-pass (~20 Hz) for maximum headroom & clarity
+    float cleanL = totalL - dcPrevInL + 0.997f * dcPrevOutL;
+    dcPrevInL = totalL;
+    dcPrevOutL = cleanL;
 
-    audioBuffer[s * 2]     = (int16_t)(finalL * 25000.0f);
-    audioBuffer[s * 2 + 1] = (int16_t)(finalR * 25000.0f);
+    float cleanR = totalR - dcPrevInR + 0.997f * dcPrevOutR;
+    dcPrevInR = totalR;
+    dcPrevOutR = cleanR;
+
+    float finalL = softLimit(cleanL);
+    float finalR = softLimit(cleanR);
+
+    audioBuffer[s * 2]     = (int32_t)(finalL * 1600000000.0f);
+    audioBuffer[s * 2 + 1] = (int32_t)(finalR * 1600000000.0f);
   }
 
   size_t written;
@@ -595,68 +657,51 @@ void drawSequencerUI() {
 }
 
 // ==========================================
-// 7. SLEEK VINTAGE CASSETTE SCREENSAVER (NO TEXT)
+// 7. SLEEK METRONOME SCREENSAVER (BPM-SYNCED, NO TEXT)
 // ==========================================
 void drawScreensaver() {
   display.clearDisplay();
 
-  reelAngle += 0.20f;
-  if (reelAngle >= 2.0f * M_PI) reelAngle -= 2.0f * M_PI;
-  animFrame++;
+  const int cx = 64;
+  const int topY = 6;
+  const int baseY = 58;
+  const int halfBase = 24;
+  const int plinthY = 51;
 
-  // 1. Minimalist Cassette Body Outline
-  int cX = 14, cY = 7, cW = 100, cH = 50;
-  display.drawRoundRect(cX, cY, cW, cH, 4, SH110X_WHITE);
+  // 1. Outer Metronome Triangle Body & Base Plinth
+  display.drawLine(cx, topY, cx - halfBase, baseY, SH110X_WHITE);
+  display.drawLine(cx, topY, cx + halfBase, baseY, SH110X_WHITE);
+  display.drawFastHLine(cx - halfBase, baseY, halfBase * 2 + 1, SH110X_WHITE);
+  display.drawFastHLine(cx - 21, plinthY, 43, SH110X_WHITE);
 
-  // Top header groove
-  display.drawFastHLine(cX + 8, cY + 4, cW - 16, SH110X_WHITE);
+  // Subtle center scale line & end-stop ticks
+  display.drawFastVLine(cx, topY + 6, 4, SH110X_WHITE);
+  display.drawPixel(cx - 12, 18, SH110X_WHITE);
+  display.drawPixel(cx + 12, 18, SH110X_WHITE);
 
-  // 2. Center Window Frame
-  int wX = cX + 14, wY = cY + 10, wW = 72, wH = 26;
-  display.drawRect(wX, wY, wW, wH, SH110X_WHITE);
+  // 2. BPM-Synced Pendulum Stick (1 swing per beat)
+  float beatPhase = ((float)millis() * (float)tempo) / 120000.0f;
+  float angle = sinf(beatPhase * 2.0f * M_PI) * 0.40f; // ~ +/- 23 deg
 
-  // 3. Dual Rotating Tape Hubs / Spools
-  int leftHubX = wX + 16, rightHubX = wX + 56, hubY = wY + 13;
-  int hubRadius = 9;
+  int pivotX = cx;
+  int pivotY = plinthY;
+  int stickLen = 38;
+  int tipX = pivotX + (int)(sinf(angle) * stickLen);
+  int tipY = pivotY - (int)(cosf(angle) * stickLen);
 
-  display.drawCircle(leftHubX,  hubY, hubRadius, SH110X_WHITE);
-  display.drawCircle(rightHubX, hubY, hubRadius, SH110X_WHITE);
-  display.drawCircle(leftHubX,  hubY, 3, SH110X_WHITE);
-  display.drawCircle(rightHubX, hubY, 3, SH110X_WHITE);
+  display.drawLine(pivotX, pivotY, tipX, tipY, SH110X_WHITE);
+  display.fillCircle(pivotX, pivotY, 2, SH110X_WHITE);
 
-  for (int i = 0; i < 3; i++) {
-    float a = reelAngle + (i * 2.0f * M_PI / 3.0f);
-    int x1 = leftHubX + (int)(cosf(a) * 3);
-    int y1 = hubY     + (int)(sinf(a) * 3);
-    int x2 = leftHubX + (int)(cosf(a) * (hubRadius - 1));
-    int y2 = hubY     + (int)(sinf(a) * (hubRadius - 1));
-    display.drawLine(x1, y1, x2, y2, SH110X_WHITE);
-
-    int rx1 = rightHubX + (int)(cosf(a) * 3);
-    int ry1 = hubY      + (int)(sinf(a) * 3);
-    int rx2 = rightHubX + (int)(cosf(a) * (hubRadius - 1));
-    int ry2 = hubY      + (int)(sinf(a) * (hubRadius - 1));
-    display.drawLine(rx1, ry1, rx2, ry2, SH110X_WHITE);
-  }
-
-  // Tape Ribbon
-  display.drawFastHLine(leftHubX, hubY - hubRadius, rightHubX - leftHubX, SH110X_WHITE);
-
-  // 4. Subtle Floating Musical Note
-  int noteY = (120 - (animFrame * 2)) % 22 + (wY + 4);
-  int noteX = 64;
-  display.fillCircle(noteX, noteY, 1, SH110X_WHITE);
-  display.drawFastVLine(noteX + 1, noteY - 5, 5, SH110X_WHITE);
-  display.drawFastHLine(noteX + 1, noteY - 5, 2, SH110X_WHITE);
-
-  // 5. Bottom Tape Head Cutout (Trapezoid)
-  int trapTopY = cY + cH - 11;
-  int trapBotY = cY + cH - 1;
-  display.drawFastHLine(cX + 28, trapTopY, 44, SH110X_WHITE);
-  display.drawLine(cX + 28, trapTopY, cX + 22, trapBotY, SH110X_WHITE);
-  display.drawLine(cX + 72, trapTopY, cX + 78, trapBotY, SH110X_WHITE);
-  display.drawCircle(cX + 32, trapTopY + 5, 2, SH110X_WHITE);
-  display.drawCircle(cX + 68, trapTopY + 5, 2, SH110X_WHITE);
+  // 3. Weighted Bob on the Stick
+  int bobR = 24;
+  int bobX = pivotX + (int)(sinf(angle) * bobR);
+  int bobY = pivotY - (int)(cosf(angle) * bobR);
+  display.fillTriangle(
+    bobX, bobY - 3,
+    bobX - 3, bobY + 3,
+    bobX + 3, bobY + 3,
+    SH110X_WHITE
+  );
 
   display.display();
 }
@@ -666,8 +711,11 @@ void drawScreensaver() {
 // ==========================================
 void updateDisplay() {
   static unsigned long lastUpdate = 0;
-  if (millis() - lastUpdate > 100) {
-    if (millis() - lastUserInteraction > 30000) {
+  bool isIdle = (millis() - lastUserInteraction > 30000);
+  unsigned long refreshInterval = isIdle ? 45 : 100;
+
+  if (millis() - lastUpdate > refreshInterval) {
+    if (isIdle) {
       drawScreensaver();
     } else {
       drawSequencerUI();
