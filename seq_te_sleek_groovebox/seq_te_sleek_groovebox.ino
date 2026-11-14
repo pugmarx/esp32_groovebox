@@ -9,7 +9,9 @@
 // 0. FIRMWARE VERSION
 // ==========================================
 #define FW_NAME    "GROOVEBOX"
-#define FW_VERSION "v5.0"
+#define FW_VERSION "v5.1"
+// v5.1: FN layer (long-press TRACK), Track Mute, Step Probability,
+//       Per-Step Note, Delay Mix, Play/Pause, and unified OLED UI.
 // v5.0: 32-bit APLL I2S, PolyBLEP oscillators, SVF resonant filter,
 //       master DC blocker, and BPM-synced metronome screensaver.
 
@@ -81,6 +83,9 @@ struct Track {
 
 Track tracks[NUM_TRACKS];
 bool sequence[NUM_TRACKS][NUM_STEPS] = {0};
+uint8_t stepProb[NUM_TRACKS][NUM_STEPS];
+int8_t stepNote[NUM_TRACKS][NUM_STEPS] = {0};
+bool trackMuted[NUM_TRACKS] = {false};
 
 int currentTrack = 0;
 int currentStep = 0;
@@ -88,6 +93,9 @@ int playbackStep = 0;
 int tempo = 120;
 int semitoneOffset = 0;
 int globalDecayMs = 160;
+float delayMix = 0.40f;
+bool fnMode = false;
+bool isPlaying = true;
 
 // MPC-Style Swing (58% shuffle - active in background)
 float swingPercent = 0.58f;
@@ -113,6 +121,10 @@ unsigned long lastUserInteraction = 0;
 
 int lastNavCLK = HIGH, lastPitchCLK = HIGH, lastDecayCLK = HIGH, lastTempoCLK = HIGH;
 int lastToggleBtn = HIGH, lastTrackBtn = HIGH;
+unsigned long trackBtnDownTime = 0;
+bool trackLongHandled = false;
+unsigned long toggleBtnDownTime = 0;
+bool toggleLongHandled = false;
 uint32_t noiseSeed = 12345;
 
 void resetScreensaverTimer() {
@@ -141,7 +153,7 @@ void updateTrackDecayTimes() {
   tracks[2].baseDecaySamples = (int)(baseDecaySamples * 1.35f);
   tracks[3].baseDecaySamples = (int)(baseDecaySamples * 1.0f);
   tracks[4].baseDecaySamples = (int)(baseDecaySamples * 0.9f);
-  tracks[5].baseDecaySamples = (int)(baseDecaySamples * 1.1f);
+  tracks[5].baseDecaySamples = (int)(baseDecaySamples * 0.65f);
   tracks[6].baseDecaySamples = (int)(baseDecaySamples * 0.85f);
   tracks[7].baseDecaySamples = (int)(baseDecaySamples * 0.75f);
 
@@ -202,6 +214,11 @@ void setup() {
   i2s_zero_dma_buffer(I2S_NUM_0);
 
   initializeTracks();
+  for (int t = 0; t < NUM_TRACKS; t++) {
+    for (int s = 0; s < NUM_STEPS; s++) {
+      stepProb[t][s] = 4; // 100% default
+    }
+  }
   memset(delayBufferL, 0, sizeof(delayBufferL));
   memset(delayBufferR, 0, sizeof(delayBufferR));
 
@@ -214,8 +231,8 @@ void setup() {
   display.print(FW_NAME);
   display.print(" ");
   display.println(FW_VERSION);
-  display.setCursor(10, 32);
-  display.println("32-bit PolyBLEP SVF");
+  display.setCursor(6, 32);
+  display.println("FN Layer + Step Prob");
   display.setCursor(26, 46);
   display.println(__DATE__);
   display.display();
@@ -235,15 +252,21 @@ void setup() {
   lastUserInteraction = millis();
 }
 
-void triggerTrack(int trackNum) {
+void triggerTrack(int trackNum, int stepNum) {
   Track &t = tracks[trackNum];
+  bool wasActive = t.active;
   t.active = true;
-  t.phase = 0.0f;
+  if (!wasActive || t.waveType == 0) {
+    t.phase = 0.0f;
+    t.envLevel = 0.0f;
+    t.envCounter = 0;
+    t.filterState1 = 0.0f;
+    t.filterState2 = 0.0f;
+  } else {
+    // Legato retrigger: avoid zero-crossing clicks & filter pops on consecutive steps
+    t.envCounter = constrain((int)(t.envLevel * t.attackSamples), 0, t.attackSamples);
+  }
   t.envStage = 1;
-  t.envCounter = 0;
-  t.envLevel = 0.0f;
-  t.filterState1 = 0.0f;
-  t.filterState2 = 0.0f;
 
   // 1. Human Micro-Dynamics (Velocity Drift: subtle ±7% natural acoustic variation)
   float humanVelocity = 0.93f + ((float)(esp_random() % 100) / 100.0f) * 0.14f;
@@ -253,17 +276,15 @@ void triggerTrack(int trackNum) {
   float decayDrift = 0.92f + ((float)(esp_random() % 100) / 100.0f) * 0.16f;
   t.currentDecaySamples = (int)(t.baseDecaySamples * decayDrift);
 
-  // 3. Funk Bass Octave Pop: 12% chance for bass (T3, T4) or pluck (T5) to pop an octave up
-  float pitchMult = 1.0f;
-  if ((trackNum == 2 || trackNum == 3 || trackNum == 4) && (esp_random() % 100 < 12)) {
-    pitchMult = 2.0f; // 1 octave jump
-  }
+  // 3. Per-step semitone offset (deterministic pitch; randomness is via Step Probability)
+  int8_t noteOff = stepNote[trackNum][stepNum];
+  float noteRatio = (noteOff == 0) ? 1.0f : powf(2.0f, (float)noteOff / 12.0f);
 
   if (t.waveType == 0) {
     t.currentFreq = 145.0f;
     sidechainAmount = 0.35f;
   } else {
-    t.currentFreq = t.baseFreq * pitchMult;
+    t.currentFreq = t.baseFreq * noteRatio;
   }
 }
 
@@ -362,8 +383,8 @@ void generateAudio() {
       else if (t.waveType == 3) {
         // PolyBLEP Saw + Resonant SVF Low-Pass with Envelope Sweep
         float saw = 2.0f * p - 1.0f - polyBlep(p, dt);
-        float f = constrain(0.06f + 0.42f * t.envLevel * t.envLevel, 0.04f, 0.78f);
-        rawSample = svfProcess(saw, t.filterState1, t.filterState2, f, 0.62f, 0) * 1.15f;
+        float f = constrain(0.06f + 0.38f * t.envLevel * t.envLevel, 0.04f, 0.72f);
+        rawSample = svfProcess(saw, t.filterState1, t.filterState2, f, 0.75f, 0) * 1.1f;
       }
       else if (t.waveType == 4) {
         // Pure Glassy FM Pluck / Chime (harmonic index decays with envelope)
@@ -385,7 +406,7 @@ void generateAudio() {
         sample *= duckMultiplier;
       }
       if (i >= 4) {
-        delaySend += sample * 0.35f;
+        delaySend += sample * 0.55f;
       }
 
       t.phase += (2.0f * M_PI * t.currentFreq) / SAMPLE_RATE;
@@ -396,21 +417,21 @@ void generateAudio() {
     }
 
     int readIdx = (delayWriteIndex - delayOffset) & DELAY_MASK;
-    float echoL = (float)delayBufferL[readIdx] / 30000.0f;
-    float echoR = (float)delayBufferR[readIdx] / 30000.0f;
+    float echoL = (float)delayBufferL[readIdx] / 26000.0f;
+    float echoR = (float)delayBufferR[readIdx] / 26000.0f;
 
-    delayFilterL = delayFilterL * 0.70f + echoL * 0.30f;
-    delayFilterR = delayFilterR * 0.70f + echoR * 0.30f;
+    delayFilterL = delayFilterL * 0.55f + echoL * 0.45f;
+    delayFilterR = delayFilterR * 0.55f + echoR * 0.45f;
 
-    float delayInL = softLimit(delaySend + (delayFilterR * 0.32f));
-    float delayInR = softLimit(            (delayFilterL * 0.32f));
+    float delayInL = softLimit(delaySend + (delayFilterR * 0.48f));
+    float delayInR = softLimit(            (delayFilterL * 0.48f));
 
     delayBufferL[delayWriteIndex] = (int16_t)(delayInL * 26000.0f);
     delayBufferR[delayWriteIndex] = (int16_t)(delayInR * 26000.0f);
     delayWriteIndex = (delayWriteIndex + 1) & DELAY_MASK;
 
-    float totalL = dryL * 0.85f + (echoL * 0.28f);
-    float totalR = dryR * 0.85f + (echoR * 0.28f);
+    float totalL = dryL * 0.85f + (echoL * delayMix);
+    float totalR = dryR * 0.85f + (echoR * delayMix);
 
     // Master DC-blocking high-pass (~20 Hz) for maximum headroom & clarity
     float cleanL = totalL - dcPrevInL + 0.997f * dcPrevOutL;
@@ -440,8 +461,13 @@ void readEncoders() {
   if (navCLK != lastNavCLK && navCLK == LOW) {
     if (millis() - lastNavTime > 5) {
       resetScreensaverTimer();
-      if (digitalRead(ENC_NAV_DT) == LOW) currentStep = (currentStep - 1 + NUM_STEPS) % NUM_STEPS;
-      else currentStep = (currentStep + 1) % NUM_STEPS;
+      int dir = (digitalRead(ENC_NAV_DT) == LOW) ? -1 : 1;
+      if (fnMode) {
+        int p = (int)stepProb[currentTrack][currentStep] + dir;
+        stepProb[currentTrack][currentStep] = (uint8_t)constrain(p, 1, 4);
+      } else {
+        currentStep = (currentStep + dir + NUM_STEPS) % NUM_STEPS;
+      }
       lastNavTime = millis();
     }
   }
@@ -450,45 +476,87 @@ void readEncoders() {
   int pitchCLK = digitalRead(ENC_PITCH_CLK);
   if (pitchCLK != lastPitchCLK && pitchCLK == LOW) {
     resetScreensaverTimer();
-    semitoneOffset = (digitalRead(ENC_PITCH_DT) == LOW) ? semitoneOffset - 1 : semitoneOffset + 1;
-    semitoneOffset = constrain(semitoneOffset, -12, 12);
-    updateTrackFrequencies();
+    int dir = (digitalRead(ENC_PITCH_DT) == LOW) ? -1 : 1;
+    if (fnMode) {
+      int n = (int)stepNote[currentTrack][currentStep] + dir;
+      stepNote[currentTrack][currentStep] = (int8_t)constrain(n, -12, 12);
+    } else {
+      semitoneOffset = constrain(semitoneOffset + dir, -12, 12);
+      updateTrackFrequencies();
+    }
   }
   lastPitchCLK = pitchCLK;
 
   int decayCLK = digitalRead(ENC_DECAY_CLK);
   if (decayCLK != lastDecayCLK && decayCLK == LOW) {
     resetScreensaverTimer();
-    globalDecayMs = (digitalRead(ENC_DECAY_DT) == LOW) ? globalDecayMs - 15 : globalDecayMs + 15;
-    globalDecayMs = constrain(globalDecayMs, 50, 600);
-    updateTrackDecayTimes();
+    int dir = (digitalRead(ENC_DECAY_DT) == LOW) ? -1 : 1;
+    if (fnMode) {
+      delayMix = constrain(delayMix + dir * 0.05f, 0.0f, 1.00f);
+    } else {
+      globalDecayMs = constrain(globalDecayMs + dir * 15, 50, 600);
+      updateTrackDecayTimes();
+    }
   }
   lastDecayCLK = decayCLK;
 
   int tempoCLK = digitalRead(ENC_TEMPO_CLK);
   if (tempoCLK != lastTempoCLK && tempoCLK == LOW) {
     resetScreensaverTimer();
-    tempo = (digitalRead(ENC_TEMPO_DT) == LOW) ? tempo + 2 : tempo - 2;
-    tempo = constrain(tempo, 60, 200);
-    delayOffset = constrain((int)((60000.0f / tempo) * 0.75f * (SAMPLE_RATE / 1000.0f)), 4000, DELAY_BUF_SIZE - 1);
+    int dir = (digitalRead(ENC_TEMPO_DT) == LOW) ? 1 : -1;
+    if (fnMode) {
+      swingPercent = constrain(swingPercent + dir * 0.02f, 0.50f, 0.68f);
+    } else {
+      tempo = constrain(tempo + dir * 2, 60, 200);
+      delayOffset = constrain((int)((60000.0f / tempo) * 0.75f * (SAMPLE_RATE / 1000.0f)), 4000, DELAY_BUF_SIZE - 1);
+    }
   }
   lastTempoCLK = tempoCLK;
 }
 
 void readButtons() {
+  unsigned long now = millis();
+
   int toggleBtn = digitalRead(BTN_TOGGLE);
   if (toggleBtn == LOW && lastToggleBtn == HIGH) {
+    toggleBtnDownTime = now;
+    toggleLongHandled = false;
     resetScreensaverTimer();
-    sequence[currentTrack][currentStep] = !sequence[currentTrack][currentStep];
-    delay(40);
+  } else if (toggleBtn == LOW && !toggleLongHandled && (now - toggleBtnDownTime >= 400)) {
+    isPlaying = !isPlaying;
+    if (isPlaying) lastStepTime = now;
+    toggleLongHandled = true;
+    resetScreensaverTimer();
+  } else if (toggleBtn == HIGH && lastToggleBtn == LOW) {
+    if (!toggleLongHandled && (now - toggleBtnDownTime >= 30)) {
+      resetScreensaverTimer();
+      if (fnMode) {
+        trackMuted[currentTrack] = !trackMuted[currentTrack];
+      } else {
+        sequence[currentTrack][currentStep] = !sequence[currentTrack][currentStep];
+      }
+    }
   }
   lastToggleBtn = toggleBtn;
 
   int trackBtn = digitalRead(BTN_TRACK);
   if (trackBtn == LOW && lastTrackBtn == HIGH) {
+    trackBtnDownTime = now;
+    trackLongHandled = false;
     resetScreensaverTimer();
-    currentTrack = (currentTrack + 1) % NUM_TRACKS;
-    delay(40);
+  } else if (trackBtn == LOW && !trackLongHandled && (now - trackBtnDownTime >= 400)) {
+    fnMode = !fnMode;
+    trackLongHandled = true;
+    resetScreensaverTimer();
+  } else if (trackBtn == HIGH && lastTrackBtn == LOW) {
+    if (!trackLongHandled && (now - trackBtnDownTime >= 30)) {
+      resetScreensaverTimer();
+      if (fnMode) {
+        fnMode = false; // Quick tap exits FN mode
+      } else {
+        currentTrack = (currentTrack + 1) % NUM_TRACKS;
+      }
+    }
   }
   lastTrackBtn = trackBtn;
 }
@@ -498,6 +566,14 @@ void readButtons() {
 // ==========================================
 void updateSequencer() {
   unsigned long now = millis();
+  if (!isPlaying) {
+    if (ledOnTime > 0) {
+      digitalWrite(LED_BEAT, LOW);
+      ledOnTime = 0;
+    }
+    return;
+  }
+
   if (now - lastStepTime >= currentStepDuration) {
     playbackStep = (playbackStep + 1) % NUM_STEPS;
     lastStepTime = now;
@@ -511,9 +587,12 @@ void updateSequencer() {
 
     bool hasActiveNote = false;
     for (int t = 0; t < NUM_TRACKS; t++) {
-      if (sequence[t][playbackStep]) {
-        triggerTrack(t);
-        hasActiveNote = true;
+      if (!trackMuted[t] && sequence[t][playbackStep]) {
+        uint8_t prob = stepProb[t][playbackStep];
+        if (prob >= 4 || (esp_random() % 100) < (prob * 25)) {
+          triggerTrack(t, playbackStep);
+          hasActiveNote = true;
+        }
       }
     }
 
@@ -545,14 +624,40 @@ void drawSequencerUI() {
   display.setCursor(0, 0);
   display.print(trackNames[currentTrack]);
 
-  String bpmStr = String(tempo) + " BPM";
-  int bpmW = bpmStr.length() * 6;
-  display.setCursor(128 - bpmW, 0);
-  display.print(bpmStr);
+  if (fnMode) {
+    display.fillRect(67, 0, 14, 8, SH110X_WHITE);
+    display.setTextColor(SH110X_BLACK);
+    display.setCursor(69, 0);
+    display.print("FN");
+    display.setTextColor(SH110X_WHITE);
+    if (trackMuted[currentTrack]) {
+      display.fillRect(82, 0, 8, 8, SH110X_WHITE);
+      display.setTextColor(SH110X_BLACK);
+      display.setCursor(83, 0);
+      display.print("M");
+      display.setTextColor(SH110X_WHITE);
+    }
+  } else if (trackMuted[currentTrack]) {
+    display.fillRect(71, 0, 9, 8, SH110X_WHITE);
+    display.setTextColor(SH110X_BLACK);
+    display.setCursor(73, 0);
+    display.print("M");
+    display.setTextColor(SH110X_WHITE);
+  }
+
+  String rightStr;
+  if (fnMode) {
+    rightStr = "SW:" + String((int)roundf(swingPercent * 100.0f)) + "%";
+  } else {
+    rightStr = isPlaying ? (String(tempo) + " BPM") : ("|| " + String(tempo));
+  }
+  int rightW = rightStr.length() * 6;
+  display.setCursor(128 - rightW, 0);
+  display.print(rightStr);
 
   display.drawFastHLine(0, 9, 128, SH110X_WHITE);
 
-  // 16 Step Graphic Pads with "Ghost" Reference Steps
+  // 16 Step Graphic Pads with Probability Height & "Ghost" Reference Steps
   for (int s = 0; s < NUM_STEPS; s++) {
     int x = getStepX(s);
     int y = 14;
@@ -567,7 +672,13 @@ void drawSequencerUI() {
     }
 
     if (thisTrackNote) {
-      display.fillRoundRect(x, y, 5, 6, 1, SH110X_WHITE);
+      uint8_t prob = stepProb[currentTrack][s];
+      if (prob >= 4) {
+        display.fillRoundRect(x, y, 5, 6, 1, SH110X_WHITE);
+      } else {
+        int h = prob + 1; // 75%=4px, 50%=3px, 25%=2px
+        display.fillRect(x, y + (6 - h), 5, h, SH110X_WHITE);
+      }
     } else if (otherTrackNote) {
       display.fillRect(x, y + 2, 5, 2, SH110X_WHITE);
     } else {
@@ -631,7 +742,15 @@ void drawSequencerUI() {
 
     if (t == currentTrack) {
       display.drawCircle(cx, circleY, 5, SH110X_WHITE);
-      display.fillCircle(cx, circleY, 3, SH110X_WHITE);
+      if (trackMuted[t]) {
+        display.drawLine(cx - 2, circleY - 2, cx + 2, circleY + 2, SH110X_WHITE);
+        display.drawLine(cx - 2, circleY + 2, cx + 2, circleY - 2, SH110X_WHITE);
+      } else {
+        display.fillCircle(cx, circleY, 3, SH110X_WHITE);
+      }
+    } else if (trackMuted[t]) {
+      display.drawLine(cx - 2, circleY - 2, cx + 2, circleY + 2, SH110X_WHITE);
+      display.drawLine(cx - 2, circleY + 2, cx + 2, circleY - 2, SH110X_WHITE);
     } else if (tracks[t].active && tracks[t].envLevel > 0.08f) {
       display.fillCircle(cx, circleY, 4, SH110X_WHITE);
     } else if (hasNotes) {
@@ -642,16 +761,32 @@ void drawSequencerUI() {
     }
   }
 
-  // Clean Bottom Line
+  // Unified Bottom Line: Key/Offset, Step Note, Step Prob, Decay (or Delay in FN)
   int noteIndex = (semitoneOffset % 12 + 12) % 12;
   display.setCursor(0, 56);
-  display.print("KEY:");
   display.print(keyNames[noteIndex]);
   if (semitoneOffset > 0) { display.print("+"); display.print(semitoneOffset); }
   else if (semitoneOffset < 0) { display.print(semitoneOffset); }
 
-  display.setCursor(68, 56);
-  display.print("DECAY:"); display.print(globalDecayMs); display.print("ms");
+  int8_t sn = stepNote[currentTrack][currentStep];
+  display.setCursor(34, 56);
+  display.print("N");
+  if (sn > 0) { display.print("+"); display.print(sn); }
+  else { display.print(sn); }
+
+  display.setCursor(64, 56);
+  display.print(stepProb[currentTrack][currentStep] * 25);
+  display.print("%");
+
+  display.setCursor(92, 56);
+  if (fnMode) {
+    display.print("W:");
+    display.print((int)roundf(delayMix * 100.0f));
+    display.print("%");
+  } else {
+    display.print("D:");
+    display.print(globalDecayMs);
+  }
 
   display.display();
 }
